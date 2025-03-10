@@ -1,30 +1,30 @@
-function processMagSensorData(sensorData, sensorIndex)
+function [x_filtered, y_filtered, z_filtered]=processMagSensorData(sensorData, sensorIndex)
 % 参数说明：
 % sensorData   : 从getMagSignal获取的传感器数据单元数组
 % sensorIndex  : 要处理的传感器编号（1-12）
 
 %% 初始化参数
-% 基线跟踪参数
-windowSize = 100;       % 滑动窗口大小（需小于数据总长度）
-% 动态检测参数
-activityThreshold = 1e-6;  % 方差阈值，需根据实际噪声调整
-activityWindow = 50;       % 动态检测窗口
-% 滤波器参数
-lpFreq = 10;           % 动态模式低通截止频率 (Hz)
-hpFreq = 0.1;          % 静态模式高通截止频率 (Hz)
-minSegmentLength = 7;       % 最小处理段长度（必须 > 3*滤波器阶数）
+windowSize = 100;           % 基线跟踪窗口
+activityThreshold = 1e-6;   % 动态检测方差阈值
+activityWindow = 50;        % 动态检测窗口
+lpFreq = 10;                % 低通截止频率 (Hz)
+hpFreq = 0.1;               % 高通截止频率 (Hz)
+minSegmentLength = 7;       % 最小处理段长度
+
+% 小波去噪参数
+waveletName = 'sym4';       % 使用的小波基
+decompLevel = 5;            % 分解层数
+denoiseMethod = 'sqtwolog'; % 阈值方法
 
 %% 数据准备
-% 提取指定传感器数据
 data = sensorData{sensorIndex};
 timestamps = data(:,1);
 x_raw = data(:,2);
 y_raw = data(:,3);
 z_raw = data(:,4);
 
-% 计算采样率
 dt = mean(diff(timestamps));
-fs = 1/dt;  % 采样频率
+fs = 1/dt;
 
 %% 阶段1：基线跟踪
 fprintf('计算基线...\n');
@@ -36,12 +36,15 @@ x_high = x_raw - baseline_x;
 y_high = y_raw - baseline_y;
 z_high = z_raw - baseline_z;
 
+%% 阶段1.5：小波去噪
+fprintf('执行小波去噪...\n');
+x_high = wden(x_high, denoiseMethod, 'h', 'mln', decompLevel, waveletName);
+y_high = wden(y_high, denoiseMethod, 'h', 'mln', decompLevel, waveletName);
+z_high = wden(z_high, denoiseMethod, 'h', 'mln', decompLevel, waveletName);
+
 %% 阶段2：动态状态检测与分段
 fprintf('检测动态状态...\n');
 N = length(x_raw);
-isDynamic = false(N,1);
-
-% 滑动方差计算
 var_x = movvar(x_high, activityWindow);
 var_y = movvar(y_high, activityWindow);
 var_z = movvar(z_high, activityWindow);
@@ -50,132 +53,97 @@ isDynamic = (var_x > activityThreshold) | ...
             (var_y > activityThreshold) | ...
             (var_z > activityThreshold);
 
-% 状态平滑处理
 isDynamic = smoothDynamicState(isDynamic, round(0.1*fs));
-
-% 获取连续区段
 segments = getContinuousSegments(isDynamic);
 
 %% 阶段3：分段滤波
 fprintf('执行分段滤波...\n');
-
-% 设计滤波器
 [b_low, a_low] = butter(2, lpFreq/(fs/2), 'low');
 [b_high, a_high] = butter(2, hpFreq/(fs/2), 'high');
 
-% 初始化输出
 x_filtered = x_raw;
 y_filtered = y_raw;
 z_filtered = z_raw;
 
-% 处理每个区段
 for k = 1:size(segments,1)
     startIdx = segments(k,1);
     endIdx = segments(k,2);
     
     if (endIdx - startIdx) < minSegmentLength
-        continue; % 跳过过短区段
+        continue;
     end
     
-    if segments(k,3) == 1 % 动态区段
-        % 低通滤波原始信号
+    if segments(k,3) == 1
         x_segment = filtfilt(b_low, a_low, x_raw(startIdx:endIdx));
         y_segment = filtfilt(b_low, a_low, y_raw(startIdx:endIdx));
         z_segment = filtfilt(b_low, a_low, z_raw(startIdx:endIdx));
-    else % 静态区段
-        % 高通滤波高频分量
+    else
         x_segment = filtfilt(b_high, a_high, x_high(startIdx:endIdx));
         y_segment = filtfilt(b_high, a_high, y_high(startIdx:endIdx));
         z_segment = filtfilt(b_high, a_high, z_high(startIdx:endIdx));
     end
     
-    % 更新输出
     x_filtered(startIdx:endIdx) = x_segment;
     y_filtered(startIdx:endIdx) = y_segment;
     z_filtered(startIdx:endIdx) = z_segment;
 end
 
-%% 可视化结果
-figure('Name','磁传感器信号处理结果','NumberTitle','off', 'Position',[100 100 1200 800])
+%% 增强可视化
+plotRange = @(data) [-1.1*max(abs(data)), 1.1*max(abs(data))]; % 统一显示范围函数
 
-% 原始信号 vs 处理结果
-subplot(3,2,1)
-plot(timestamps, x_raw)
+% 时域对比
+figure('Name','时域分析','NumberTitle','off', 'Position',[100 100 1400 900])
+plotTDRange(x_raw, x_filtered, timestamps, 'X轴', 1, plotRange([x_raw; x_filtered]))
+plotTDRange(y_raw, y_filtered, timestamps, 'Y轴', 3, plotRange([y_raw; y_filtered]))
+plotTDRange(z_raw, z_filtered, timestamps, 'Z轴', 5, plotRange([z_raw; z_filtered]))
+
+% 频域对比
+figure('Name','频域分析','NumberTitle','off', 'Position',[100 100 1400 900])
+plotPSDRange(x_raw, x_filtered, fs, 'X轴', 1)
+plotPSDRange(y_raw, y_filtered, fs, 'Y轴', 3)
+plotPSDRange(z_raw, z_filtered, fs, 'Z轴', 5)
+
+end
+
+%% 可视化子函数
+function plotTDRange(raw, filtered, t, titleStr, subPos, yRange)
+subplot(3,2,subPos)
+plot(t, raw)
 hold on
-plot(timestamps, baseline_x, 'LineWidth',2)
-title('X轴原始信号与基线')
-legend('原始信号','估计基线')
+plot(t, filtered, 'LineWidth',1.5)
+title([titleStr '时域信号'])
+xlabel('时间 (s)'), ylabel('幅值')
+grid on
+ylim(yRange)
+legend('原始信号','处理后')
 
-subplot(3,2,3)
-plot(timestamps, y_raw)
-hold on
-plot(timestamps, baseline_y, 'LineWidth',2)
-title('Y轴原始信号与基线')
+subplot(3,2,subPos+1)
+plot(t, filtered)
+title([titleStr '处理后细节'])
+xlabel('时间 (s)'), ylabel('幅值')
+grid on
+ylim(yRange)
+end
 
-subplot(3,2,5)
-plot(timestamps, z_raw)
-hold on
-plot(timestamps, baseline_z, 'LineWidth',2)
-title('Z轴原始信号与基线')
-
-% 滤波结果
-subplot(3,2,2)
-plot(timestamps, x_filtered)
-title('X轴滤波结果')
-ylim([-max(abs(x_filtered)) max(abs(x_filtered))])
-
-subplot(3,2,4)
-plot(timestamps, y_filtered)
-title('Y轴滤波结果')
-ylim([-max(abs(y_filtered)) max(abs(y_filtered))])
-
-subplot(3,2,6)
-plot(timestamps, z_filtered)
-title('Z轴滤波结果')
-ylim([-max(abs(z_filtered)) max(abs(z_filtered))])
-
-%% 频谱分析对比
-figure('Name','频谱分析','NumberTitle','off', 'Position',[100 100 1000 800])
-
-% X轴频谱
-subplot(3,2,1)
-[Pxx,f] = pwelch(x_raw, [],[],[],fs);
+function plotPSDRange(raw, filtered, fs, titleStr, subPos)
+subplot(3,2,subPos)
+[Pxx, f] = pwelch(raw, hanning(1024), 512, 1024, fs);
 semilogx(f, 10*log10(Pxx))
-title('X轴原始频谱')
-xlabel('频率 (Hz)')
+hold on
+[PxxF, f] = pwelch(filtered, hanning(1024), 512, 1024, fs);
+semilogx(f, 10*log10(PxxF))
+title([titleStr '功率谱'])
+xlabel('频率 (Hz)'), ylabel('PSD (dB/Hz)')
+grid on
+xlim([1e-2 fs/2])
+legend('原始','处理后')
 
-subplot(3,2,2)
-[Pxx,f] = pwelch(x_filtered, [],[],[],fs);
-semilogx(f, 10*log10(Pxx))
-title('X轴滤波后频谱')
-xlabel('频率 (Hz)')
-
-% Y轴频谱
-subplot(3,2,3)
-[Pyy,f] = pwelch(y_raw, [],[],[],fs);
-semilogx(f, 10*log10(Pyy))
-title('Y轴原始频谱')
-xlabel('频率 (Hz)')
-
-subplot(3,2,4)
-[Pyy,f] = pwelch(y_filtered, [],[],[],fs);
-semilogx(f, 10*log10(Pyy))
-title('Y轴滤波后频谱')
-xlabel('频率 (Hz)')
-
-% Z轴频谱
-subplot(3,2,5)
-[Pzz,f] = pwelch(z_raw, [],[],[],fs);
-semilogx(f, 10*log10(Pzz))
-title('Z轴原始频谱')
-xlabel('频率 (Hz)')
-
-subplot(3,2,6)
-[Pzz,f] = pwelch(z_filtered, [],[],[],fs);
-semilogx(f, 10*log10(Pzz))
-title('Z轴滤波后频谱')
-xlabel('频率 (Hz)')
-
+subplot(3,2,subPos+1)
+plot(f, 10*log10(PxxF./Pxx))
+title([titleStr 'PSD变化'])
+xlabel('频率 (Hz)'), ylabel('增益 (dB)')
+grid on
+xlim([1e-2 fs/2])
 end
 
 %% 辅助函数：获取连续区段
